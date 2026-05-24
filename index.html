@@ -16,9 +16,35 @@
   <div id="root"></div>
 
   <script type="text/babel" data-type="module">
+    
+    const GLOBAL_ONEDRIVE_URL = ""; 
+
+    
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyA0nr6o8gDHQk9DAWEGKsntKre4Do3QRn4",
+  authDomain: "dashboard-906fd.firebaseapp.com",
+  databaseURL: "https://dashboard-906fd-default-rtdb.firebaseio.com",
+  projectId: "dashboard-906fd",
+  storageBucket: "dashboard-906fd.firebasestorage.app",
+  messagingSenderId: "788644878275",
+  appId: "1:788644878275:web:5bdf9026ddac01cb354f76",
+  measurementId: "G-WTYJEY35P5"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+    // =====================================================================
+
     const { useState, useMemo, useRef, useEffect } = React;
 
-    const hasFirebase = typeof __firebase_config !== 'undefined';
     let fApp, fAuth, fDb, fAppId, fbFuncs;
 
     class ErrorBoundary extends React.Component {
@@ -63,23 +89,30 @@
       
       const [isAddModalOpen, setIsAddModalOpen] = useState(false);
       const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+      const [isUrlModalOpen, setIsUrlModalOpen] = useState(false);
+      const [urlInput, setUrlInput] = useState(GLOBAL_ONEDRIVE_URL);
+      const [isLoading, setIsLoading] = useState(false);
+
       const [formData, setFormData] = useState({});
-      
-      const [confirmDialog, setConfirmDialog] = useState(null);
       const [errorMsg, setErrorMsg] = useState(null);
+      const [confirmDialog, setConfirmDialog] = useState(null);
       const fileInputRef = useRef(null);
 
       // Статуси підключення: 'initializing', 'connected', 'local'
       const [dbStatus, setDbStatus] = useState('initializing');
       const [user, setUser] = useState(null);
 
-      // 1. Ініціалізація Хмарної Бази Даних
+      // попытка инициалки базы данных
       useEffect(() => {
         const initFirebase = async () => {
-          if (!hasFirebase) {
+          const hasEnvFirebase = typeof __firebase_config !== 'undefined';
+          const hasCustomFirebase = MY_FIREBASE_CONFIG && MY_FIREBASE_CONFIG.apiKey !== "";
+          
+          if (!hasEnvFirebase && !hasCustomFirebase) {
              setDbStatus('local');
              return;
           }
+
           try {
              const { initializeApp } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js");
              const { getAuth, onAuthStateChanged, signInWithCustomToken, signInAnonymously } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js");
@@ -87,13 +120,13 @@
 
              fbFuncs = { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch };
 
-             const firebaseConfig = JSON.parse(__firebase_config);
+             const firebaseConfig = hasEnvFirebase ? JSON.parse(__firebase_config) : MY_FIREBASE_CONFIG;
              fApp = initializeApp(firebaseConfig);
              fAuth = getAuth(fApp);
              fDb = getFirestore(fApp);
-             fAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+             fAppId = hasEnvFirebase && typeof __app_id !== 'undefined' ? __app_id : 'bchs-dashboard-app';
 
-             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+             if (hasEnvFirebase && typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                 await signInWithCustomToken(fAuth, __initial_auth_token);
              } else {
                 await signInAnonymously(fAuth);
@@ -112,7 +145,7 @@
         initFirebase();
       }, []);
 
-      // 2. синхра
+      // получение данных
       useEffect(() => {
          if (dbStatus === 'connected' && user) {
             const metaRef = fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'metadata', 'config');
@@ -132,11 +165,13 @@
             if (savedData && savedHeaders && savedData !== '[]') {
                 setData(JSON.parse(savedData));
                 setHeaders(JSON.parse(savedHeaders));
+            } else if (GLOBAL_ONEDRIVE_URL) {
+                fetchFromUrl(GLOBAL_ONEDRIVE_URL);
             }
          }
       }, [dbStatus, user]);
 
-      // 3. сохран записей
+      // сохран записей
       const saveNewRecord = async (record) => {
         if (dbStatus === 'connected' && user) {
            await fbFuncs.setDoc(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', record._id), record);
@@ -169,7 +204,6 @@
 
       const handleFullUpload = async (newData, newHeaders) => {
         if (dbStatus === 'connected' && user) {
-           // батчим
            const batch = fbFuncs.writeBatch(fDb);
            batch.set(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'metadata', 'config'), { headers: newHeaders });
            newData.forEach(item => {
@@ -197,10 +231,13 @@
             localStorage.removeItem('bchs_headers');
             setData([]);
             setHeaders([]);
+            if (GLOBAL_ONEDRIVE_URL) {
+               fetchFromUrl(GLOBAL_ONEDRIVE_URL);
+            }
          }
       };
 
-      // помогаем функционалом
+      // вспомогательные функции
       const normalizeRecord = (obj, rawHeaders) => {
         const findKey = (keywords) => {
           let exact = rawHeaders.find(h => keywords.includes(String(h).trim().toLowerCase()));
@@ -238,43 +275,50 @@
         return obj;
       };
 
+      const parseExcelBuffer = async (arrayBuffer) => {
+        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+        if (workbook.SheetNames.length === 0) throw new Error("Excel-файл порожній.");
+
+        let targetSheetName = workbook.SheetNames.find(name => {
+          const n = String(name).toLowerCase();
+          return n.includes('загальний') || n.includes('список') || n.includes('заг. список');
+        });
+        
+        if (!targetSheetName) {
+          targetSheetName = workbook.SheetNames[0];
+          setErrorMsg(`УВАГА: Не знайдено аркуш "Загальний список". Використано "${targetSheetName}".`);
+        } else {
+          setErrorMsg(null);
+        }
+
+        const worksheet = workbook.Sheets[targetSheetName];
+        const json = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+
+        if (json.length === 0) throw new Error(`Аркуш порожній.`);
+
+        const rawHeaders = Object.keys(json[0]);
+        const parsedData = json.map(row => {
+          const obj = {};
+          for (let key in row) {
+            obj[key] = (row[key] !== undefined && row[key] !== null) ? String(row[key]) : '';
+          }
+          obj._id = Math.random().toString(36).substr(2, 9);
+          return normalizeRecord(obj, rawHeaders);
+        });
+
+        await handleFullUpload(parsedData, rawHeaders);
+      };
+
       const handleFileUpload = (e) => {
         const file = e.target.files[0];
         if (!file) return;
-
         const fileExt = file.name.split('.').pop().toLowerCase();
+
         if (fileExt === 'xlsx' || fileExt === 'xls') {
           const reader = new FileReader();
           reader.onload = async (evt) => {
             try {
-              const arrayBuffer = evt.target.result;
-              const workbook = XLSX.read(arrayBuffer, { type: 'array' });
-              
-              if (workbook.SheetNames.length === 0) throw new Error("Excel-файл порожній (немає аркушів).");
-
-              let targetSheetName = workbook.SheetNames.find(name => {
-                const n = String(name).toLowerCase();
-                return n.includes('загальний') || n.includes('список') || n.includes('заг. список');
-              });
-              
-              if (!targetSheetName) targetSheetName = workbook.SheetNames[0];
-
-              const worksheet = workbook.Sheets[targetSheetName];
-              const json = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
-
-              if (json.length === 0) throw new Error(`Аркуш '${targetSheetName}' порожній.`);
-
-              const rawHeaders = Object.keys(json[0]);
-              const parsedData = json.map(row => {
-                const obj = {};
-                for (let key in row) {
-                  obj[key] = (row[key] !== undefined && row[key] !== null) ? String(row[key]) : '';
-                }
-                obj._id = Math.random().toString(36).substr(2, 9);
-                return normalizeRecord(obj, rawHeaders);
-              });
-
-              await handleFullUpload(parsedData, rawHeaders);
+              await parseExcelBuffer(evt.target.result);
               fileInputRef.current.value = "";
               setErrorMsg(null);
             } catch (error) {
@@ -283,8 +327,38 @@
           };
           reader.readAsArrayBuffer(file);
         } else {
-          setErrorMsg("Будь ласка, завантажуйте оригінальний Excel файл (.xlsx або .xls)");
+          setErrorMsg("Завантажуйте оригінальний Excel файл (.xlsx або .xls)");
         }
+      };
+
+      const fetchFromUrl = async (targetUrl) => {
+        setIsLoading(true);
+        setErrorMsg(null);
+        try {
+          let fetchUrl = targetUrl;
+          if (fetchUrl.includes('onedrive') || fetchUrl.includes('1drv.ms') || fetchUrl.includes('sharepoint')) {
+             if (!fetchUrl.includes('download=1')) {
+                fetchUrl = fetchUrl.includes('?') ? fetchUrl + '&download=1' : fetchUrl + '?download=1';
+             }
+          }
+          const proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(fetchUrl);
+          const response = await fetch(proxyUrl);
+          if (!response.ok) throw new Error(`Помилка мережі ${response.status}`);
+          
+          const arrayBuffer = await response.arrayBuffer();
+          await parseExcelBuffer(arrayBuffer);
+          setIsUrlModalOpen(false);
+        } catch (error) {
+          setErrorMsg("Не вдалося завантажити файл за посиланням. Спробуйте завантажити файл вручну.");
+          console.error(error);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      const handleUrlFetchSubmit = (e) => {
+        e.preventDefault();
+        if (urlInput) fetchFromUrl(urlInput);
       };
 
       const exportExcel = () => {
@@ -316,6 +390,7 @@
       const closeModals = () => {
         setIsAddModalOpen(false);
         setIsEditModalOpen(false);
+        setIsUrlModalOpen(false);
         setFormData({});
       };
 
@@ -343,7 +418,7 @@
         document.body.removeChild(textArea);
       };
 
-      // фильтры и статы
+      // фильтра и статы
       const filteredData = useMemo(() => {
         if (!searchQuery) return data;
         const query = searchQuery.toLowerCase();
@@ -474,13 +549,18 @@
                   {data.length > 0 && (
                     <>
                       <button onClick={() => setConfirmDialog({
-                        text: "Ви впевнені, що хочете видалити всю базу даних? Це вилучить дані з хмари для всіх користувачів!",
+                        text: dbStatus === 'connected' 
+                          ? "Ви впевнені, що хочете очистити Хмарну базу? Це видалить дані для ВСІХ користувачів!" 
+                          : "Ви впевнені, що хочете очистити локальну пам'ять?",
                         action: performClearAllData
                       })} className="flex items-center gap-2 px-3 py-2 bg-red-900/30 hover:bg-red-900/50 text-red-400 text-sm font-medium rounded-lg border border-red-900/50 transition-colors" title="Скинути всі дані">
                         <i className="ph ph-trash text-lg"></i> Очистити базу
                       </button>
-                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-700 transition-colors text-blue-300">
-                        <i className="ph ph-upload-simple text-lg"></i> Імпорт з Excel
+                      <button onClick={() => setIsUrlModalOpen(true)} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-700 transition-colors text-blue-300">
+                        <i className="ph ph-link text-lg"></i> Імпорт з OneDrive
+                      </button>
+                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-700 transition-colors">
+                        <i className="ph ph-upload-simple text-lg"></i> Імпорт з файлу
                       </button>
                       <button onClick={exportExcel} className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg shadow-lg shadow-emerald-900/20 transition-colors">
                         <i className="ph ph-file-xls text-lg"></i> Експорт в Excel
@@ -526,15 +606,23 @@
             {data.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 px-4 text-center border-2 border-dashed border-slate-800/80 rounded-3xl bg-slate-900/40 mt-8 shadow-inner">
                 <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 border border-emerald-500/20 relative">
-                  <i className="ph ph-database text-5xl text-emerald-400"></i>
+                  {isLoading ? (
+                    <i className="ph ph-spinner-gap animate-spin text-5xl text-emerald-400"></i>
+                  ) : (
+                    <i className="ph ph-database text-5xl text-emerald-400"></i>
+                  )}
                 </div>
-                <h2 className="text-3xl font-bold text-white mb-4">База даних порожня</h2>
+                <h2 className="text-3xl font-bold text-white mb-4">{isLoading ? 'Завантаження бази...' : 'База даних порожня'}</h2>
                 <p className="text-slate-400 max-w-lg mb-8 text-lg">
-                  Завантажте ваш оригінальний Excel-файл (.xlsx) для ініціалізації бази. Всі подальші зміни будуть синхронізовані в <b>Хмарі</b> та доступні іншим командирам за посиланням.
+                  Для налаштування реал-тайм синхронізації на вашому сервері, створіть безкоштовну БД у <b>Firebase</b> і вставте ключі в код панелі.
                 </p>
-                <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-3 px-8 py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-[0_0_30px_-5px_rgba(37,99,235,0.4)] transition-all hover:-translate-y-1">
-                  <i className="ph ph-upload-simple text-2xl"></i> Завантажити файл Excel
-                </button>
+                {!isLoading && (
+                  <div className="flex gap-4">
+                    <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-3 px-8 py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl shadow-[0_0_30px_-5px_rgba(16,185,129,0.4)] transition-all hover:-translate-y-1">
+                      <i className="ph ph-upload-simple text-2xl"></i> Завантажити файл
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -808,7 +896,38 @@
             )}
           </div>
 
-          {/* форма редактирования */}
+          {/* окно юрл */}
+          {isUrlModalOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg shadow-2xl">
+                <div className="p-6 border-b border-slate-800 flex justify-between items-center">
+                  <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                    <i className="ph ph-cloud-arrow-down text-blue-400 text-xl"></i> Завантаження з OneDrive
+                  </h2>
+                  <button onClick={closeModals} className="text-slate-400 hover:text-white transition-colors text-2xl">&times;</button>
+                </div>
+                <form onSubmit={handleUrlFetchSubmit} className="p-6">
+                  <p className="text-sm text-slate-400 mb-4">Вставте публічне посилання на ваш Excel файл. Панель імпортує дані, після чого ви зможете автономно редагувати їх прямо тут.</p>
+                  <input 
+                    type="url" 
+                    value={urlInput}
+                    onChange={(e) => setUrlInput(e.target.value)}
+                    required
+                    placeholder="https://1drv.ms/x/c/..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500/50 outline-none mb-6"
+                  />
+                  <div className="flex justify-end gap-3">
+                    <button type="button" onClick={closeModals} className="px-5 py-2.5 text-sm font-medium text-slate-300 hover:bg-slate-800 rounded-xl">Скасувати</button>
+                    <button type="submit" disabled={isLoading} className="px-5 py-2.5 text-sm font-bold text-white bg-blue-600 hover:bg-blue-500 rounded-xl shadow-lg disabled:opacity-50 flex items-center gap-2">
+                      {isLoading ? <><i className="ph ph-spinner animate-spin text-lg"></i> Зв'язок з сервером...</> : 'Завантажити базу'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* форма добавления редактирование */}
           {(isAddModalOpen || isEditModalOpen) && (
             <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
               <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-5xl shadow-2xl my-8">
