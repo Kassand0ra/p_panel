@@ -15,8 +15,11 @@
 <body class="bg-slate-950 text-slate-200 font-sans selection:bg-blue-500/30">
   <div id="root"></div>
 
-  <script type="text/babel">
+  <script type="text/babel" data-type="module">
     const { useState, useMemo, useRef, useEffect } = React;
+
+    const hasFirebase = typeof __firebase_config !== 'undefined';
+    let fApp, fAuth, fDb, fAppId, fbFuncs;
 
     class ErrorBoundary extends React.Component {
       constructor(props) {
@@ -33,7 +36,7 @@
               <div className="max-w-2xl bg-red-900/20 border border-red-500/50 rounded-2xl p-8 text-center">
                 <i className="ph-fill ph-warning-circle text-red-500 text-6xl mb-4"></i>
                 <h1 className="text-2xl font-bold text-white mb-2">Сталася критична помилка</h1>
-                <p className="text-slate-300 mb-6">Панель не змогла обробити файл через непередбачений формат даних. Перезавантажте сторінку та спробуйте інший файл.</p>
+                <p className="text-slate-300 mb-6">Панель не змогла обробити файл. Перезавантажте сторінку.</p>
                 <div className="bg-black/40 p-4 rounded-lg text-left font-mono text-sm text-red-300 overflow-auto">
                   {this.state.errorMsg}
                 </div>
@@ -57,22 +60,163 @@
       const [headers, setHeaders] = useState([]);
       const [searchQuery, setSearchQuery] = useState('');
       const [expandedId, setExpandedId] = useState(null);
+      
       const [isAddModalOpen, setIsAddModalOpen] = useState(false);
-      
-      // Додані стани для редагування
       const [isEditModalOpen, setIsEditModalOpen] = useState(false);
-      const [editingRecord, setEditingRecord] = useState(null);
+      const [formData, setFormData] = useState({});
       
+      const [confirmDialog, setConfirmDialog] = useState(null);
       const [errorMsg, setErrorMsg] = useState(null);
       const fileInputRef = useRef(null);
 
-      // ключи
+      // Статуси підключення: 'initializing', 'connected', 'local'
+      const [dbStatus, setDbStatus] = useState('initializing');
+      const [user, setUser] = useState(null);
+
+      // 1. Ініціалізація Хмарної Бази Даних
+      useEffect(() => {
+        const initFirebase = async () => {
+          if (!hasFirebase) {
+             setDbStatus('local');
+             return;
+          }
+          try {
+             const { initializeApp } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js");
+             const { getAuth, onAuthStateChanged, signInWithCustomToken, signInAnonymously } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js");
+             const { getFirestore, collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
+
+             fbFuncs = { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch };
+
+             const firebaseConfig = JSON.parse(__firebase_config);
+             fApp = initializeApp(firebaseConfig);
+             fAuth = getAuth(fApp);
+             fDb = getFirestore(fApp);
+             fAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(fAuth, __initial_auth_token);
+             } else {
+                await signInAnonymously(fAuth);
+             }
+
+             onAuthStateChanged(fAuth, (u) => {
+                setUser(u);
+                if (u) setDbStatus('connected');
+             });
+
+          } catch(err) {
+             console.error("Firebase init err:", err);
+             setDbStatus('local');
+          }
+        };
+        initFirebase();
+      }, []);
+
+      // 2. синхра
+      useEffect(() => {
+         if (dbStatus === 'connected' && user) {
+            const metaRef = fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'metadata', 'config');
+            const un_meta = fbFuncs.onSnapshot(metaRef, snap => {
+                if (snap.exists()) setHeaders(snap.data().headers || []);
+            });
+            const collRef = fbFuncs.collection(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel');
+            const un_coll = fbFuncs.onSnapshot(collRef, snap => {
+                const items = [];
+                snap.forEach(d => items.push({_id: d.id, ...d.data()}));
+                setData(items);
+            });
+            return () => { un_meta(); un_coll(); };
+         } else if (dbStatus === 'local') {
+            const savedData = localStorage.getItem('bchs_data');
+            const savedHeaders = localStorage.getItem('bchs_headers');
+            if (savedData && savedHeaders && savedData !== '[]') {
+                setData(JSON.parse(savedData));
+                setHeaders(JSON.parse(savedHeaders));
+            }
+         }
+      }, [dbStatus, user]);
+
+      // 3. сохран записей
+      const saveNewRecord = async (record) => {
+        if (dbStatus === 'connected' && user) {
+           await fbFuncs.setDoc(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', record._id), record);
+        } else {
+           const newData = [record, ...data];
+           setData(newData);
+           localStorage.setItem('bchs_data', JSON.stringify(newData));
+        }
+      };
+
+      const saveEditedRecord = async (record) => {
+        if (dbStatus === 'connected' && user) {
+           await fbFuncs.setDoc(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', record._id), record);
+        } else {
+           const newData = data.map(i => i._id === record._id ? record : i);
+           setData(newData);
+           localStorage.setItem('bchs_data', JSON.stringify(newData));
+        }
+      };
+
+      const doDeleteRecord = async (id) => {
+        if (dbStatus === 'connected' && user) {
+           await fbFuncs.deleteDoc(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', id));
+        } else {
+           const newData = data.filter(i => i._id !== id);
+           setData(newData);
+           localStorage.setItem('bchs_data', JSON.stringify(newData));
+        }
+      };
+
+      const handleFullUpload = async (newData, newHeaders) => {
+        if (dbStatus === 'connected' && user) {
+           // батчим
+           const batch = fbFuncs.writeBatch(fDb);
+           batch.set(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'metadata', 'config'), { headers: newHeaders });
+           newData.forEach(item => {
+               batch.set(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', item._id), item);
+           });
+           await batch.commit();
+        } else {
+           setData(newData);
+           setHeaders(newHeaders);
+           localStorage.setItem('bchs_data', JSON.stringify(newData));
+           localStorage.setItem('bchs_headers', JSON.stringify(newHeaders));
+        }
+      };
+
+      const performClearAllData = async () => {
+         if (dbStatus === 'connected' && user) {
+            const batch = fbFuncs.writeBatch(fDb);
+            data.forEach(item => {
+               batch.delete(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'personnel', item._id));
+            });
+            batch.set(fbFuncs.doc(fDb, 'artifacts', fAppId, 'public', 'data', 'metadata', 'config'), { headers: [] });
+            await batch.commit();
+         } else {
+            localStorage.removeItem('bchs_data');
+            localStorage.removeItem('bchs_headers');
+            setData([]);
+            setHeaders([]);
+         }
+      };
+
+      // помогаем функционалом
       const normalizeRecord = (obj, rawHeaders) => {
-        const findKey = (keywords) => rawHeaders.find(h => keywords.some(k => String(h).toLowerCase().includes(k)));
+        const findKey = (keywords) => {
+          let exact = rawHeaders.find(h => keywords.includes(String(h).trim().toLowerCase()));
+          if (exact) return exact;
+          let partials = rawHeaders.filter(h => keywords.some(k => String(h).toLowerCase().includes(k)));
+          if (partials.length > 0) return partials.sort((a, b) => a.length - b.length)[0];
+          return undefined;
+        };
+
         const pibKey = findKey(['піб', 'п.і.б', 'прізвище', 'фio', 'имя']);
         const statusKey = findKey(['статус', 'стан']);
         const zvaniaKey = findKey(['звання', 'звание']);
-        const posadaKey = rawHeaders.find(h => String(h).toLowerCase().includes('посада') && !String(h).toLowerCase().includes('повна') && !String(h).toLowerCase().includes('id'));
+        const posadaKey = rawHeaders.find(h => {
+          const lower = String(h).toLowerCase();
+          return lower.includes('посада') && !lower.includes('повна') && !lower.includes('id');
+        });
         const fullPosadaKey = findKey(['повна посада']);
         const callsignKey = findKey(['позивний', 'позывной']);
         const rotaKey = findKey(['рота']);
@@ -99,41 +243,28 @@
         if (!file) return;
 
         const fileExt = file.name.split('.').pop().toLowerCase();
-
         if (fileExt === 'xlsx' || fileExt === 'xls') {
           const reader = new FileReader();
-          reader.onload = (evt) => {
+          reader.onload = async (evt) => {
             try {
               const arrayBuffer = evt.target.result;
               const workbook = XLSX.read(arrayBuffer, { type: 'array' });
               
-              if (workbook.SheetNames.length === 0) {
-                setErrorMsg("УВАГА: Excel-файл порожній (немає аркушів).");
-                return;
-              }
+              if (workbook.SheetNames.length === 0) throw new Error("Excel-файл порожній (немає аркушів).");
 
               let targetSheetName = workbook.SheetNames.find(name => {
                 const n = String(name).toLowerCase();
                 return n.includes('загальний') || n.includes('список') || n.includes('заг. список');
               });
               
-              if (!targetSheetName) {
-                targetSheetName = workbook.SheetNames[0];
-                setErrorMsg(`УВАГА: Не знайдено аркуш "Загальний список". Панель завантажила перший доступний аркуш ("${targetSheetName}"). Перевірте, чи вірні дані.`);
-              } else {
-                setErrorMsg(null);
-              }
+              if (!targetSheetName) targetSheetName = workbook.SheetNames[0];
 
               const worksheet = workbook.Sheets[targetSheetName];
               const json = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
 
-              if (json.length === 0) {
-                setErrorMsg(`УВАГА: Аркуш '${targetSheetName}' порожній.`);
-                return;
-              }
+              if (json.length === 0) throw new Error(`Аркуш '${targetSheetName}' порожній.`);
 
               const rawHeaders = Object.keys(json[0]);
-              
               const parsedData = json.map(row => {
                 const obj = {};
                 for (let key in row) {
@@ -143,10 +274,9 @@
                 return normalizeRecord(obj, rawHeaders);
               });
 
-              setHeaders(rawHeaders);
-              setData(parsedData);
+              await handleFullUpload(parsedData, rawHeaders);
               fileInputRef.current.value = "";
-
+              setErrorMsg(null);
             } catch (error) {
               setErrorMsg("Помилка читання Excel файлу: " + error.message);
             }
@@ -171,10 +301,34 @@
         XLSX.writeFile(workbook, "Особовий_склад_Оновлено.xlsx");
       };
 
-      const deleteRecord = (id) => {
-        if(confirm("Ви впевнені, що хочете видалити цього військовослужбовця?")) {
-          setData(data.filter(item => item._id !== id));
+      const openAddModal = () => {
+        const initialForm = {};
+        headers.forEach(h => { if(h !== '_id') initialForm[h] = ''; });
+        setFormData(initialForm);
+        setIsAddModalOpen(true);
+      };
+
+      const openEditModal = (person) => {
+        setFormData({ ...person });
+        setIsEditModalOpen(true);
+      };
+
+      const closeModals = () => {
+        setIsAddModalOpen(false);
+        setIsEditModalOpen(false);
+        setFormData({});
+      };
+
+      const handleSaveForm = (e) => {
+        e.preventDefault();
+        const normalized = normalizeRecord({ ...formData }, headers);
+        if (isEditModalOpen) {
+          saveEditedRecord(normalized);
+        } else {
+          normalized._id = Math.random().toString(36).substr(2, 9);
+          saveNewRecord(normalized);
         }
+        closeModals();
       };
 
       const copyToClipboard = (text, e) => {
@@ -189,6 +343,7 @@
         document.body.removeChild(textArea);
       };
 
+      // фильтры и статы
       const filteredData = useMemo(() => {
         if (!searchQuery) return data;
         const query = searchQuery.toLowerCase();
@@ -265,113 +420,25 @@
         return 'bg-slate-700 text-slate-300 border-slate-600';
       };
 
-      // ключ для списка
       const statusHeaderKey = useMemo(() => {
-        return headers.find(h => String(h).toLowerCase().includes('статус') || String(h).toLowerCase() === 'стан');
+        return headers.find(h => String(h).trim().toLowerCase() === 'статус') || 
+               headers.find(h => String(h).toLowerCase().includes('статус'));
       }, [headers]);
 
-      // компонент для добавления
-      const renderFormModal = (isEdit = false) => {
-        const record = isEdit ? editingRecord : null;
-        if (isEdit && !record) return null;
-
-        return (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl shadow-2xl my-8">
-              <div className="p-6 border-b border-slate-800 flex justify-between items-center sticky top-0 bg-slate-900 rounded-t-2xl z-10">
-                <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                  {isEdit ? (
-                    <><i className="ph ph-pencil-simple text-blue-400 text-xl"></i> Редагувати інформацію</>
-                  ) : (
-                    <><i className="ph ph-user-plus text-emerald-400 text-xl"></i> Додати військовослужбовця</>
-                  )}
-                </h2>
-                <button onClick={() => { setIsAddModalOpen(false); setIsEditModalOpen(false); setEditingRecord(null); }} className="text-slate-400 hover:text-white transition-colors text-2xl">
-                  &times;
-                </button>
-              </div>
-              
-              <form 
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const formData = new FormData(e.target);
-                  const newRecord = isEdit ? { ...editingRecord } : { _id: Math.random().toString(36).substr(2, 9) };
-                  
-                  headers.forEach(h => {
-                    if(h !== '_id') newRecord[h] = formData.get(h) || '';
-                  });
-                  
-                  const normalized = normalizeRecord(newRecord, headers);
-                  
-                  if (isEdit) {
-                    setData(data.map(item => item._id === normalized._id ? normalized : item));
-                    setIsEditModalOpen(false);
-                    setEditingRecord(null);
-                  } else {
-                    setData([normalized, ...data]);
-                    setIsAddModalOpen(false);
-                  }
-                }}
-                className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
-              >
-                {headers.map(header => {
-                  if(header === '_id') return null;
-                  const isStatusField = header === statusHeaderKey;
-                  
-                  return (
-                    <div key={header} className="flex flex-col gap-1.5">
-                      <label className="text-xs font-medium text-slate-400 ml-1">{header}</label>
-                      {isStatusField ? (
-                        <select name={header} defaultValue={isEdit ? record[header] : ''} className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all">
-                          <option value="">Не вказано</option>
-                          <option value="В строю">В строю</option>
-                          <option value="ОП">ОП</option>
-                          <option value="Лікування">Лікування</option>
-                          <option value="Відпустка">Відпустка</option>
-                          <option value="СЗЧ">СЗЧ</option>
-                          <option value="500">500</option>
-                          <option value="200">200</option>
-                          <option value="Відрядження">Відрядження</option>
-                          <option value="Гауптвахта">Гауптвахта</option>
-                          <option value="Вакансія">Вакансія</option>
-                        </select>
-                      ) : (
-                        <input name={header} type="text" defaultValue={isEdit ? record[header] : ''} className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all" placeholder={`Введіть ${String(header).toLowerCase()}`} />
-                      )}
-                    </div>
-                  )
-                })}
-                <div className="col-span-full pt-6 flex justify-end gap-3 border-t border-slate-800 mt-4">
-                  <button type="button" onClick={() => { setIsAddModalOpen(false); setIsEditModalOpen(false); setEditingRecord(null); }} className="px-5 py-2.5 text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 rounded-xl transition-colors">Скасувати</button>
-                  <button type="submit" className={`px-5 py-2.5 text-sm font-medium text-white rounded-xl shadow-lg transition-all ${isEdit ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/20' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/20'}`}>
-                    {isEdit ? 'Зберегти зміни' : 'Зберегти'}
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        );
-      }
-
-      const renderExpandedDetails = (person) => (
-        <div className="px-6 pb-6 pt-2 border-t border-slate-800/50 bg-slate-900/30">
-          <h4 className="text-sm font-medium text-slate-400 mb-4 uppercase tracking-wider">Повна інформація з таблиці</h4>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-4">
-            {headers.map(header => {
-              if (header === '_id') return null;
-              const value = person[header];
-              return (
-                <div key={header} className="flex flex-col space-y-1">
-                  <span className="text-xs text-slate-500 font-medium">{header}</span>
-                  <span className="text-sm text-slate-200 bg-slate-950/50 px-3 py-2 rounded border border-slate-800/60 break-words">
-                    {value || <span className="text-slate-600 italic">Пусто</span>}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      );
+      const formHeadersSorted = useMemo(() => {
+        if (headers.length === 0) return [];
+        const topPriority = ['ПІБ', 'Позивний', 'СТАТУС', 'Звання', 'Посада', 'Повна посада', 'Рота', 'Взвод', 'Місце перебування'];
+        const sorted = [];
+        topPriority.forEach(p => {
+          const match = headers.find(h => String(h).trim().toLowerCase() === p.toLowerCase()) || 
+                        headers.find(h => String(h).toLowerCase().includes(p.toLowerCase()));
+          if (match && !sorted.includes(match)) sorted.push(match);
+        });
+        headers.forEach(h => {
+          if (h !== '_id' && !sorted.includes(h)) sorted.push(h);
+        });
+        return sorted;
+      }, [headers]);
 
       return (
         <div className="flex flex-col min-h-screen">
@@ -384,15 +451,36 @@
                   </div>
                   <div>
                     <h1 className="text-xl font-bold text-white tracking-tight">Панель Управління Підрозділом</h1>
-                    <p className="text-xs text-slate-400 font-medium tracking-wide uppercase">Система обліку особового складу</p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      {dbStatus === 'connected' ? (
+                         <span className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full border border-blue-500/30">
+                            <div className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse"></div> Хмарна синхронізація (Real-time)
+                         </span>
+                      ) : dbStatus === 'local' ? (
+                         <span className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400"></div> Локальний режим
+                         </span>
+                      ) : (
+                         <span className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider bg-slate-700/50 text-slate-400 px-2 py-0.5 rounded-full">
+                            Підключення до бази...
+                         </span>
+                      )}
+                    </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 flex-wrap justify-end">
                   <input type="file" accept=".xlsx, .xls" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
+                  
                   {data.length > 0 && (
                     <>
-                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-700 transition-colors">
-                        <i className="ph ph-upload-simple text-blue-400 text-lg"></i> Оновити Excel
+                      <button onClick={() => setConfirmDialog({
+                        text: "Ви впевнені, що хочете видалити всю базу даних? Це вилучить дані з хмари для всіх користувачів!",
+                        action: performClearAllData
+                      })} className="flex items-center gap-2 px-3 py-2 bg-red-900/30 hover:bg-red-900/50 text-red-400 text-sm font-medium rounded-lg border border-red-900/50 transition-colors" title="Скинути всі дані">
+                        <i className="ph ph-trash text-lg"></i> Очистити базу
+                      </button>
+                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-700 transition-colors text-blue-300">
+                        <i className="ph ph-upload-simple text-lg"></i> Імпорт з Excel
                       </button>
                       <button onClick={exportExcel} className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg shadow-lg shadow-emerald-900/20 transition-colors">
                         <i className="ph ph-file-xls text-lg"></i> Експорт в Excel
@@ -404,14 +492,32 @@
             </div>
           </header>
 
+          {/* кастомное окно */}
+          {confirmDialog && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl">
+                 <div className="flex items-center gap-3 mb-4">
+                    <i className="ph-fill ph-warning-circle text-red-500 text-3xl"></i>
+                    <h3 className="text-xl font-bold text-white">Підтвердження дії</h3>
+                 </div>
+                 <p className="text-slate-300 mb-8">{confirmDialog.text}</p>
+                 <div className="flex justify-end gap-3">
+                    <button onClick={() => setConfirmDialog(null)} className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl transition-colors font-medium">Скасувати</button>
+                    <button onClick={() => { confirmDialog.action(); setConfirmDialog(null); }} className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl shadow-lg transition-colors font-bold">Підтвердити</button>
+                 </div>
+              </div>
+            </div>
+          )}
+
           {errorMsg && (
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
               <div className="bg-red-500/10 border border-red-500/50 rounded-xl p-4 flex items-start gap-3">
                 <i className="ph-fill ph-warning-circle text-red-400 text-2xl mt-0.5"></i>
-                <div>
+                <div className="flex-1">
                   <h3 className="text-red-400 font-bold mb-1">Увага!</h3>
                   <p className="text-sm text-red-200">{errorMsg}</p>
                 </div>
+                <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-300"><i className="ph ph-x text-xl"></i></button>
               </div>
             </div>
           )}
@@ -419,15 +525,15 @@
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full">
             {data.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 px-4 text-center border-2 border-dashed border-slate-800/80 rounded-3xl bg-slate-900/40 mt-8 shadow-inner">
-                <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 border border-emerald-500/20">
-                  <i className="ph ph-file-xls text-5xl text-emerald-400"></i>
+                <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 border border-emerald-500/20 relative">
+                  <i className="ph ph-database text-5xl text-emerald-400"></i>
                 </div>
-                <h2 className="text-3xl font-bold text-white mb-4">Дані відсутні</h2>
+                <h2 className="text-3xl font-bold text-white mb-4">База даних порожня</h2>
                 <p className="text-slate-400 max-w-lg mb-8 text-lg">
-                  Завантажте ваш оригінальний <b>Excel-файл (.xlsx)</b>. Панель автоматично знайде вкладку <i>"Загальний список"</i> та завантажить лише необхідні дані.
+                  Завантажте ваш оригінальний Excel-файл (.xlsx) для ініціалізації бази. Всі подальші зміни будуть синхронізовані в <b>Хмарі</b> та доступні іншим командирам за посиланням.
                 </p>
                 <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-3 px-8 py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-[0_0_30px_-5px_rgba(37,99,235,0.4)] transition-all hover:-translate-y-1">
-                  <i className="ph ph-upload-simple text-2xl"></i> Завантажити Excel файл
+                  <i className="ph ph-upload-simple text-2xl"></i> Завантажити файл Excel
                 </button>
               </div>
             ) : (
@@ -453,7 +559,7 @@
                           <i className="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xl"></i>
                           <input type="text" placeholder="Пошук за ПІБ, Позивним або Посадою..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full pl-10 pr-4 py-2.5 bg-slate-900 border border-slate-800 rounded-xl focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all placeholder:text-slate-600" />
                         </div>
-                        <button onClick={() => setIsAddModalOpen(true)} className="flex items-center justify-center gap-2 px-5 py-2.5 bg-emerald-600/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-600/20 rounded-xl font-medium transition-all">
+                        <button onClick={openAddModal} className="flex items-center justify-center gap-2 px-5 py-2.5 bg-emerald-600/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-600/20 rounded-xl font-medium transition-all">
                           <i className="ph ph-user-plus text-lg"></i> Додати бійця
                         </button>
                       </div>
@@ -506,10 +612,13 @@
                                       {person['СТАТУС'] || 'Не вказано'}
                                     </span>
                                     <div className="md:hidden flex items-center gap-3">
-                                      <button onClick={(e) => { e.stopPropagation(); setEditingRecord(person); setIsEditModalOpen(true); }} className="p-2 text-slate-500 hover:text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors">
+                                      <button onClick={(e) => { e.stopPropagation(); openEditModal(person); }} className="p-2 text-slate-500 hover:text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors">
                                         <i className="ph ph-pencil-simple text-lg"></i>
                                       </button>
-                                      <button onClick={(e) => { e.stopPropagation(); deleteRecord(person._id); }} className="p-2 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors">
+                                      <button onClick={(e) => { 
+                                         e.stopPropagation(); 
+                                         setConfirmDialog({ text: "Видалити цього військовослужбовця?", action: () => doDeleteRecord(person._id) }); 
+                                      }} className="p-2 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors">
                                         <i className="ph ph-trash text-lg"></i>
                                       </button>
                                       <div className="p-1 text-slate-500">
@@ -518,10 +627,13 @@
                                     </div>
                                   </div>
                                   <div className="hidden md:flex col-span-2 items-center justify-end gap-3">
-                                    <button onClick={(e) => { e.stopPropagation(); setEditingRecord(person); setIsEditModalOpen(true); }} className="p-2 text-slate-500 hover:text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors" title="Редагувати">
+                                    <button onClick={(e) => { e.stopPropagation(); openEditModal(person); }} className="p-2 text-slate-500 hover:text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors" title="Редагувати">
                                       <i className="ph ph-pencil-simple text-lg"></i>
                                     </button>
-                                    <button onClick={(e) => { e.stopPropagation(); deleteRecord(person._id); }} className="p-2 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors" title="Видалити">
+                                    <button onClick={(e) => { 
+                                         e.stopPropagation(); 
+                                         setConfirmDialog({ text: "Видалити цього військовослужбовця?", action: () => doDeleteRecord(person._id) }); 
+                                    }} className="p-2 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors" title="Видалити">
                                       <i className="ph ph-trash text-lg"></i>
                                     </button>
                                     <div className="p-1 text-slate-500">
@@ -529,7 +641,25 @@
                                     </div>
                                   </div>
                                 </div>
-                                {isExpanded && renderExpandedDetails(person)}
+                                {isExpanded && (
+                                  <div className="px-6 pb-6 pt-2 border-t border-slate-800/50 bg-slate-900/30">
+                                    <h4 className="text-sm font-medium text-slate-400 mb-4 uppercase tracking-wider">Повна інформація з таблиці</h4>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-4">
+                                      {headers.map(header => {
+                                        if (header === '_id') return null;
+                                        const value = person[header];
+                                        return (
+                                          <div key={header} className="flex flex-col space-y-1">
+                                            <span className="text-xs text-slate-500 font-medium">{header}</span>
+                                            <span className="text-sm text-slate-200 bg-slate-950/50 px-3 py-2 rounded border border-slate-800/60 break-words">
+                                              {value || <span className="text-slate-600 italic">Пусто</span>}
+                                            </span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                             );
                           })}
@@ -642,7 +772,23 @@
                                         {isLocExpanded && (
                                           <tr>
                                             <td colSpan="3" className="p-0 bg-slate-900/30">
-                                              {renderExpandedDetails(p)}
+                                              <div className="px-6 pb-6 pt-2 border-t border-slate-800/50 bg-slate-900/30">
+                                                <h4 className="text-sm font-medium text-slate-400 mb-4 uppercase tracking-wider">Повна інформація з таблиці</h4>
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-4">
+                                                  {headers.map(header => {
+                                                    if (header === '_id') return null;
+                                                    const value = p[header];
+                                                    return (
+                                                      <div key={header} className="flex flex-col space-y-1">
+                                                        <span className="text-xs text-slate-500 font-medium">{header}</span>
+                                                        <span className="text-sm text-slate-200 bg-slate-950/50 px-3 py-2 rounded border border-slate-800/60 break-words">
+                                                          {value || <span className="text-slate-600 italic">Пусто</span>}
+                                                        </span>
+                                                      </div>
+                                                    );
+                                                  })}
+                                                </div>
+                                              </div>
                                             </td>
                                           </tr>
                                         )}
@@ -662,9 +808,74 @@
             )}
           </div>
 
-          {/* Модальні вікна */}
-          {isAddModalOpen && renderFormModal(false)}
-          {isEditModalOpen && renderFormModal(true)}
+          {/* форма редактирования */}
+          {(isAddModalOpen || isEditModalOpen) && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-5xl shadow-2xl my-8">
+                <div className="p-6 border-b border-slate-800 flex justify-between items-center sticky top-0 bg-slate-900 rounded-t-2xl z-10 shadow-sm">
+                  <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                    {isEditModalOpen ? (
+                      <><i className="ph ph-pencil-simple text-blue-400 text-xl"></i> Редагувати інформацію</>
+                    ) : (
+                      <><i className="ph ph-user-plus text-emerald-400 text-xl"></i> Додати військовослужбовця</>
+                    )}
+                  </h2>
+                  <button onClick={closeModals} className="text-slate-400 hover:text-white transition-colors text-2xl">
+                    &times;
+                  </button>
+                </div>
+                
+                <form onSubmit={handleSaveForm} className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+                  {formHeadersSorted.map(header => {
+                    const isStatusField = header === statusHeaderKey;
+                    const isPib = String(header).toLowerCase().includes('піб') || String(header).toLowerCase().includes('прізвище');
+                    const isWide = isPib || String(header).toLowerCase().includes('повна посада') || String(header).toLowerCase().includes('примітки');
+                    
+                    return (
+                      <div key={header} className={`flex flex-col gap-1.5 ${isWide ? 'md:col-span-2 lg:col-span-3 xl:col-span-4' : ''}`}>
+                        <label className="text-xs font-bold text-slate-400 ml-1 uppercase tracking-wider">{header}</label>
+                        {isStatusField ? (
+                          <select 
+                            name={header} 
+                            value={formData[header] || ''} 
+                            onChange={(e) => setFormData({...formData, [header]: e.target.value})}
+                            className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all shadow-inner"
+                          >
+                            <option value="">Не вказано</option>
+                            <option value="В строю">В строю</option>
+                            <option value="ОП">ОП</option>
+                            <option value="Лікування">Лікування</option>
+                            <option value="Відпустка">Відпустка</option>
+                            <option value="СЗЧ">СЗЧ</option>
+                            <option value="500">500</option>
+                            <option value="200">200</option>
+                            <option value="Відрядження">Відрядження</option>
+                            <option value="Гауптвахта">Гауптвахта</option>
+                            <option value="Вакансія">Вакансія</option>
+                          </select>
+                        ) : (
+                          <input 
+                            name={header} 
+                            type="text" 
+                            value={formData[header] || ''} 
+                            onChange={(e) => setFormData({...formData, [header]: e.target.value})}
+                            className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all shadow-inner" 
+                            placeholder={header} 
+                          />
+                        )}
+                      </div>
+                    )
+                  })}
+                  <div className="col-span-full pt-6 flex justify-end gap-3 border-t border-slate-800 mt-4">
+                    <button type="button" onClick={closeModals} className="px-6 py-3 text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 rounded-xl transition-colors">Скасувати</button>
+                    <button type="submit" className={`px-8 py-3 text-sm font-bold text-white rounded-xl shadow-lg transition-all ${isEditModalOpen ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/20' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/20'}`}>
+                      {isEditModalOpen ? 'Зберегти зміни' : 'Зберегти'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
           
           <div className="mt-auto pt-10 pb-6 flex items-center justify-center gap-2 text-slate-500 opacity-60 hover:opacity-100 transition-opacity">
             <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 text-slate-400" viewBox="0 0 256 256" fill="currentColor">
